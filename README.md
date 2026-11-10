@@ -2,7 +2,7 @@
 
 Telegram notifications for [Claude Code](https://claude.com/claude-code) — and a way to answer them from your phone.
 
-- A **`Stop` hook** sends you a message when Claude finishes a reply: the start of the reply (Markdown rendered as Telegram HTML), when it started and ended, the model, the tokens and what they cost at API list prices.
+- A **`Stop` hook** sends you a message when Claude finishes a reply: the whole reply (Markdown rendered as Telegram HTML), when it started and ended, the model, the tokens and what they cost at API list prices.
 - An optional **reply channel**: swipe-reply to a notification in Telegram, and your text reaches *that* Claude Code session as if you had typed it in the terminal. Waiting for your reply costs **no tokens** — it is done by a small plain Node process, not by the model.
 
 Node.js 18+ is the only requirement. No dependencies, no build step.
@@ -74,12 +74,14 @@ The hook reads the session's transcript (`transcript_path` from the hook input) 
 | Part | Source |
 |---|---|
 | Project | the name of the working directory |
-| Reply text | the last assistant message, cut at 700 characters, then converted from Markdown: `**bold**`, headings, `` `code` ``, fenced code, lists, links and tables (tables become monospaced blocks) |
+| Reply text | the last assistant message **in full**, converted from Markdown: `**bold**`, headings, `` `code` ``, fenced code, lists, links and tables (tables become monospaced blocks) |
 | Time | the start of the turn (your last message), its end, and the duration |
 | Model, context | the model of the last reply and the size of its context |
 | Tokens, cost | input, output and cache tokens of this reply and of the whole session |
 
-If Telegram rejects the markup, the same message is sent again as plain text.
+**Long replies.** Telegram refuses a message over 4096 characters, so a longer reply goes as several messages, cut between lines and code blocks (a very long code block becomes several code blocks) and never inside a tag. They are numbered (`1/3`, `2/3`, …), the project name is on the first and the statistics on the last. A reply to any of them reaches the session. Set `TELEGRAM_NOTIFY_MAX_CHARS` if you would rather cut the reply at some length.
+
+If Telegram rejects the markup of a message, that message is sent again as plain text.
 
 **Cost** is computed per API call, with the price of the model that made that call (a session can mix models), from the `PRICES` table at the top of `telegram-notify.mjs`: `[input, output, cache read]` in dollars per million tokens. A cache write is priced at 1.25× the input price (5-minute TTL) or 2× (1-hour TTL); fast mode counts double. These are API list prices: on a subscription you do not pay them, read the number as "what it would cost". A model that is not in the table is marked `+?` — add a line for it. Prices are as of 2026-11-03; check the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
 
@@ -138,6 +140,7 @@ A `Monitor` lives at most **30 minutes**. When it expires the agent gets a notic
 | `TELEGRAM_NOTIFY_TOKEN` | bot token | — |
 | `TELEGRAM_NOTIFY_CHAT_ID` | your chat id; the only one accepted | — |
 | `TELEGRAM_NOTIFY_ENV` | path of the `KEY=VALUE` file with the two above | `~/.claude/telegram-notify.env` |
+| `TELEGRAM_NOTIFY_MAX_CHARS` | cut the reply text at this many characters; `0` — send it whole | `0` |
 | `TELEGRAM_NOTIFY_INBOX` | `off` — no reply channel: no routes recorded, no daemon started | on |
 | `TELEGRAM_NOTIFY_DATA` | where the daemon keeps routes, inboxes, offset, pid and log | `~/.claude/telegram-inbox` |
 | `TELEGRAM_NOTIFY_IDLE_HOURS` | the daemon ends after this many hours without a notification | `12` |

@@ -16,7 +16,11 @@ if (existsSync(join(homedir(), '.claude', 'telegram-notify.paused'))) {
 }
 
 const { token: TOKEN, chat: CHAT_ID } = loadConfig();
-const MAX = 700;
+// The reply is sent whole. TELEGRAM_NOTIFY_MAX_CHARS=N cuts it at N characters (0: no cut).
+const MAX = Number(process.env.TELEGRAM_NOTIFY_MAX_CHARS ?? 0);
+
+// Telegram refuses a message over 4096 characters: longer ones go as several, cut at this size.
+const LIMIT = 3900;
 
 // USD per 1M tokens: [input, output, cache read]. API list prices (2026-11-03); a cache write costs
 // 1.25x the input price for 5 minutes, 2x for 1 hour. A subscription is not billed this way: this is "what it would cost".
@@ -291,8 +295,8 @@ function inline(line) {
         .join('');
 }
 
-// The reply is cut first, then converted: every tag it makes is closed on its own line.
-function toHtml(markdown) {
+// Every tag it makes is closed within its own line or code block, so a cut between blocks never breaks one.
+function toBlocks(markdown) {
     const out = [];
     const pieces = markdown.split(/```[^\n]*\n?/);
 
@@ -335,12 +339,81 @@ function toHtml(markdown) {
         flush();
     });
 
-    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return out;
 }
 
-// What the plain-text fallback shows: the markdown without its marks.
-function toPlain(markdown) {
-    return markdown.replace(/\*\*/g, '').replace(/`/g, '');
+// The text of a chunk without its markup: what is sent when Telegram refuses the HTML.
+function stripTags(html) {
+    return html.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+// Cuts a long text at a line break, else at a space outside any tag, else hard (not inside an entity or a tag).
+function cutAt(text, size) {
+    if (text.length <= size) {
+        return [text, ''];
+    }
+
+    const head = text.slice(0, size);
+    let at = head.lastIndexOf('\n');
+
+    if (at < size / 2) {
+        at = -1;
+
+        for (let i = 0, depth = 0; i < head.length; i++) {
+            if (head[i] === '<') depth = head.startsWith('</', i) ? depth - 1 : depth + 1;
+            if (head[i] === ' ' && depth <= 0) at = i;
+        }
+    }
+
+    if (at < size / 2) {
+        at = size;
+
+        const open = Math.max(head.lastIndexOf('&'), head.lastIndexOf('<'));
+
+        if (open > head.lastIndexOf(';') && open > head.lastIndexOf('>')) at = open;
+    }
+
+    return [text.slice(0, at), text.slice(at).replace(/^\n/, '')];
+}
+
+// A block longer than a message: a code block is cut into code blocks, anything else at spaces.
+function splitBlock(block, size) {
+    if (block.length <= size) {
+        return [block];
+    }
+
+    const pre = block.startsWith('<pre>') && block.endsWith('</pre>');
+    const pieces = [];
+    let rest = pre ? block.slice(5, -6) : block;
+
+    while (rest !== '') {
+        const [piece, left] = cutAt(rest, pre ? size - 11 : size);
+        pieces.push(pre ? `<pre>${piece}</pre>` : piece);
+        rest = left;
+    }
+
+    return pieces;
+}
+
+// Messages of at most `size` characters, cut between blocks.
+function chunks(blocks, size = LIMIT) {
+    const parts = [];
+    let current = '';
+
+    const flush = () => {
+        const text = current.replace(/\n{3,}/g, '\n\n').trim();
+        if (text !== '') parts.push(text);
+        current = '';
+    };
+
+    for (const block of blocks.flatMap((b) => splitBlock(b, size))) {
+        if (current !== '' && current.length + block.length + 1 > size) flush();
+        current += (current === '' ? '' : '\n') + block;
+    }
+
+    flush();
+
+    return parts;
 }
 
 // The last reply of the main conversation: the hook's own field when there is one, else the transcript.
@@ -366,7 +439,7 @@ function lastReply(input, rows) {
     return '';
 }
 
-async function send(payload) {
+async function send(payload, retried = false) {
     const response = await fetch(`${API}/bot${TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -381,6 +454,13 @@ async function send(payload) {
         json = JSON.parse(text);
     } catch {
         // not JSON: the status says enough
+    }
+
+    /* Too many messages at once: Telegram says how long to wait; once is enough. */
+    if (response.status === 429 && !retried) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(20, json?.parameters?.retry_after ?? 3) * 1000));
+
+        return send(payload, true);
     }
 
     return { status: response.status, body: text.slice(0, 160), json };
@@ -420,20 +500,25 @@ async function main() {
     const project = input.cwd ? basename(input.cwd) : '';
     let reply = lastReply(input, readRows(input)).trim();
 
-    if (reply.length > MAX) {
+    if (MAX > 0 && reply.length > MAX) {
         reply = reply.slice(0, MAX).trimEnd() + '…';
     }
 
     reply = reply || 'Закончил ответ.';
 
     const foot = footer(input);
-    const html = [project ? `<b>${escapeHtml(project)}</b>` : '', toHtml(reply), foot?.html ?? ''].filter(Boolean).join('\n\n');
-    const plain = [project, toPlain(reply), foot?.plain ?? ''].filter(Boolean).join('\n\n');
+    const blocks = [project ? `<b>${escapeHtml(project)}</b>` : '', '', ...toBlocks(reply), '', foot?.html ?? ''];
+    let parts = chunks(blocks);
+
+    /* Several messages are numbered, so the order is clear on the phone. */
+    if (parts.length > 1) {
+        parts = parts.map((part, i) => (i === 0 ? part : `<i>${i + 1}/${parts.length}</i>\n${part}`));
+        parts[0] = `${parts[0]}\n<i>1/${parts.length}</i>`;
+    }
 
     /* TG_NOTIFY_DRY=1: only show what would be sent. */
     if (process.env.TG_NOTIFY_DRY) {
-        console.log(html);
-        console.log('\n--- plain fallback ---\n' + plain);
+        parts.forEach((part, i) => console.log(`${i > 0 ? '\n' : ''}--- message ${i + 1} of ${parts.length}, ${part.length} characters ---\n${part}`));
         console.log(`\n--- token and chat id: ${TOKEN && CHAT_ID ? 'found' : 'MISSING'} ---`);
 
         return;
@@ -448,24 +533,27 @@ async function main() {
         return;
     }
 
-    try {
-        let result = await send({ text: html, parse_mode: 'HTML' });
+    for (const part of parts) {
+        try {
+            let result = await send({ text: part, parse_mode: 'HTML' });
 
-        /* Telegram refused the markup: the same message as plain text, nothing is lost. */
-        if (result.status === 400) {
-            result = await send({ text: plain });
-        }
+            /* Telegram refused the markup: the same piece as plain text, nothing is lost. */
+            if (result.status === 400) {
+                result = await send({ text: stripTags(part) });
+            }
 
-        rememberRoute(input, project, reply, result);
+            /* A reply to any of the pieces goes to this session. */
+            rememberRoute(input, project, reply, result);
 
-        /* TG_NOTIFY_DEBUG=1: what was sent and what Telegram said, for checking by hand. */
-        if (process.env.TG_NOTIFY_DEBUG) {
-            console.log(html);
-            console.log('---', result.status, result.body);
-        }
-    } catch (error) {
-        if (process.env.TG_NOTIFY_DEBUG) {
-            console.log('failed:', error?.message);
+            /* TG_NOTIFY_DEBUG=1: what was sent and what Telegram said, for checking by hand. */
+            if (process.env.TG_NOTIFY_DEBUG) {
+                console.log(part);
+                console.log('---', result.status, result.body);
+            }
+        } catch (error) {
+            if (process.env.TG_NOTIFY_DEBUG) {
+                console.log('failed:', error?.message);
+            }
         }
     }
 }

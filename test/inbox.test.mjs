@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -179,4 +179,46 @@ test('without a token nothing starts and nothing fails', async () => {
 
     assert.equal(await new Promise((resolve) => daemon.on('exit', resolve)), 0);
     assert.ok(!existsSync(join(data, 'daemon.pid')));
+});
+
+test('a long reply goes whole, in messages under the Telegram limit, with every tag closed', () => {
+    let markdown = '## Long\n\n';
+    for (let i = 1; i <= 60; i++) markdown += `Paragraph ${i}: **bold** and \`code\` and [link](https://example.com/${i}) - text text text text.\n\n`;
+    markdown += '```js\n' + Array.from({ length: 400 }, (_, i) => `const line${i} = ${i} < 10 && "a&b";`).join('\n') + '\n```\n';
+    markdown += 'The end: ' + 'word '.repeat(1000);
+
+    const run = spawnSync(process.execPath, [join(root, 'telegram-notify.mjs')], {
+        input: JSON.stringify({ cwd: '/work/project', last_assistant_message: markdown }),
+        env: { ...process.env, TG_NOTIFY_DRY: '1', TELEGRAM_NOTIFY_TOKEN: '1:t', TELEGRAM_NOTIFY_CHAT_ID: '1' },
+        encoding: 'utf8',
+    });
+
+    const messages = run.stdout.split(/\n?--- message \d+ of \d+, \d+ characters ---\n/).slice(1).map((m) => m.replace(/\n--- token and chat id[\s\S]*$/, ''));
+
+    assert.ok(messages.length > 1);
+    assert.ok(messages[0].startsWith('<b>project</b>'));
+    assert.ok(messages.every((m) => m.length <= 4096));
+
+    for (const message of messages) {
+        for (const tag of ['b', 'i', 'code', 'pre', 'a']) {
+            assert.equal((message.match(new RegExp(`<${tag}[ >]`, 'g')) ?? []).length, (message.match(new RegExp(`</${tag}>`, 'g')) ?? []).length, `<${tag}> balanced`);
+        }
+    }
+
+    // Nothing is lost: every paragraph and the last line are there, in order.
+    const all = messages.join('\n');
+    for (let i = 1; i <= 60; i++) assert.ok(all.includes(`Paragraph ${i}:`));
+    assert.ok(all.includes('const line399 = 399 &lt; 10 &amp;&amp; "a&amp;b";'));
+    assert.ok(all.includes('The end:'));
+
+    // A short reply is one message; TELEGRAM_NOTIFY_MAX_CHARS cuts it.
+    const short = spawnSync(process.execPath, [join(root, 'telegram-notify.mjs')], {
+        input: JSON.stringify({ cwd: '/work/project', last_assistant_message: 'x'.repeat(500) }),
+        env: { ...process.env, TG_NOTIFY_DRY: '1', TELEGRAM_NOTIFY_MAX_CHARS: '100', TELEGRAM_NOTIFY_TOKEN: '1:t', TELEGRAM_NOTIFY_CHAT_ID: '1' },
+        encoding: 'utf8',
+    });
+
+    assert.match(short.stdout, /message 1 of 1/);
+    assert.ok(short.stdout.includes('x'.repeat(100) + '…'));
+    assert.ok(!short.stdout.includes('x'.repeat(101)));
 });
