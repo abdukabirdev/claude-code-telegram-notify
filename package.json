@@ -1,0 +1,11 @@
+{
+  "name": "claude-code-telegram-notify",
+  "version": "1.0.0",
+  "description": "Telegram notifications for Claude Code, and replies from your phone",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test test/inbox.test.mjs"
+  }
+}

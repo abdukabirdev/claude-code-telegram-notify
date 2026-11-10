@@ -3,35 +3,16 @@
 // the tokens and what they cost at API list prices.
 // Setup: see README.md (token and chat id come from the environment or telegram-notify.env).
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { API, loadConfig, ensureData, paths, daemonRunning } from './telegram-lib.mjs';
 
 // Chat-bot mode: while this file exists, terminal replies are not forwarded to Telegram.
 if (existsSync(join(homedir(), '.claude', 'telegram-notify.paused'))) {
     process.exit(0);
-}
-
-// The bot token and the chat id: TELEGRAM_NOTIFY_TOKEN / TELEGRAM_NOTIFY_CHAT_ID from the environment, else from
-// a KEY=VALUE file (TELEGRAM_NOTIFY_ENV, default ~/.claude/telegram-notify.env). Never written in this file.
-function loadConfig() {
-    const config = { token: process.env.TELEGRAM_NOTIFY_TOKEN ?? '', chat: process.env.TELEGRAM_NOTIFY_CHAT_ID ?? '' };
-    const file = process.env.TELEGRAM_NOTIFY_ENV || join(homedir(), '.claude', 'telegram-notify.env');
-
-    if ((!config.token || !config.chat) && existsSync(file)) {
-        for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
-            const match = /^\s*(?:export\s+)?(TELEGRAM_NOTIFY_[A-Z_]+)\s*=\s*(.*?)\s*$/.exec(line);
-
-            if (!match) continue;
-
-            const value = match[2].replace(/^(['"])(.*)\1$/, '$2');
-
-            if (match[1] === 'TELEGRAM_NOTIFY_TOKEN' && !config.token) config.token = value;
-            if (match[1] === 'TELEGRAM_NOTIFY_CHAT_ID' && !config.chat) config.chat = value;
-        }
-    }
-
-    return config;
 }
 
 const { token: TOKEN, chat: CHAT_ID } = loadConfig();
@@ -386,14 +367,45 @@ function lastReply(input, rows) {
 }
 
 async function send(payload) {
-    const response = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+    const response = await fetch(`${API}/bot${TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: CHAT_ID, link_preview_options: { is_disabled: true }, ...payload }),
         signal: AbortSignal.timeout(10000),
     });
 
-    return { status: response.status, body: (await response.text()).slice(0, 160) };
+    const text = await response.text();
+    let json = null;
+
+    try {
+        json = JSON.parse(text);
+    } catch {
+        // not JSON: the status says enough
+    }
+
+    return { status: response.status, body: text.slice(0, 160), json };
+}
+
+// A reply to this message goes to this session: the inbox daemon (telegram-inbox.mjs) reads this table.
+// TELEGRAM_NOTIFY_INBOX=off: no replies from Telegram.
+function rememberRoute(input, project, reply, result) {
+    const messageId = result?.json?.result?.message_id;
+
+    if (process.env.TELEGRAM_NOTIFY_INBOX === 'off' || !messageId || !input.session_id) {
+        return;
+    }
+
+    try {
+        ensureData();
+        appendFileSync(paths.routes, JSON.stringify({ message_id: messageId, session_id: input.session_id, project, at: new Date().toISOString(), text: reply.slice(0, 160) }) + '\n');
+
+        if (!daemonRunning()) {
+            const daemon = fileURLToPath(new URL('./telegram-inbox.mjs', import.meta.url));
+            spawn(process.execPath, [daemon], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+        }
+    } catch {
+        // the notification is sent; the reply channel is a bonus
+    }
 }
 
 async function main() {
@@ -443,6 +455,8 @@ async function main() {
         if (result.status === 400) {
             result = await send({ text: plain });
         }
+
+        rememberRoute(input, project, reply, result);
 
         /* TG_NOTIFY_DEBUG=1: what was sent and what Telegram said, for checking by hand. */
         if (process.env.TG_NOTIFY_DEBUG) {
