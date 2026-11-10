@@ -109,7 +109,9 @@ If Telegram rejects the markup, the same message is sent again as plain text.
 
 ### Starting the watcher in a session
 
-Either ask the agent once per session — *"start the Monitor with `node ~/.claude/telegram-inbox-watch.mjs <session id>`"* — or register the optional **`SessionStart` hook**, which tells the agent how to do it by itself (it adds a couple of lines of context once per session):
+Either ask the agent — *"start the Monitor with `node ~/.claude/telegram-inbox-watch.mjs <session id>`"* — or register the optional **`SessionStart` hook**, which tells the agent how to do it by itself (it adds a few lines of context once per session).
+
+A `Monitor` lives at most **30 minutes**. When it expires the agent gets a notice and has to start it again — a few tokens each time. Nothing is lost meanwhile: messages wait in the inbox, and a new watcher prints them first.
 
 ```json
 {
@@ -123,7 +125,7 @@ Either ask the agent once per session — *"start the Monitor with `node ~/.clau
 
 ### What to expect
 
-- It works while the session is open. If you close Claude Code, nobody is there to read the reply (the message stays in the inbox until the watcher for that session is started again).
+- It works while the session is open **and a watcher is running** (see the 30-minute limit above). If you close Claude Code, nobody is there to read the reply; the message stays in the inbox until a watcher for that session is started again.
 - Only text is accepted. A photo, a voice message or a sticker gets a one-line answer saying so.
 - The first time the daemon starts it ignores everything written before — old messages are not replayed as instructions.
 - The daemon ends by itself after 12 hours without a notification and is started again by the next one.

@@ -23,7 +23,8 @@ process.stdout.write(JSON.stringify({
         hookEventName: 'SessionStart',
         additionalContext:
             'The owner can answer your Telegram notifications from the phone. To receive those answers, start the Monitor tool ' +
-            `once in this session (persistent) with the command: node "${watcher}" ${input.session_id}\n` +
+            `in this session with timeout_ms 1800000 and the command: node "${watcher}" ${input.session_id}\n` +
+            'A Monitor ends after at most 30 minutes: when its expiry notice arrives, start it again with the same command.\n' +
             'Every line it prints that starts with [Telegram is a message from the owner, to be treated as if they had typed it here.',
     },
 }));
